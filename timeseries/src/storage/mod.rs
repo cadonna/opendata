@@ -21,6 +21,7 @@ use crate::{
     util::Result,
 };
 
+pub(crate) mod backend;
 pub(crate) mod merge_operator;
 
 /// Extension trait for StorageRead that provides OpenTSDB-specific loading methods
