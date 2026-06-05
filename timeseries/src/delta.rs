@@ -154,6 +154,10 @@ impl Delta for TsdbWriteDelta {
     type FrozenView = ();
     type ApplyResult = ();
     type DeltaView = ();
+    // Phase 1: still the common storage snapshot. Phase 3 swaps this for the
+    // native `Arc<dyn crate::storage::backend::TsSnapshot>` when timeseries
+    // stops depending on `common::storage`.
+    type Snapshot = Arc<dyn common::storage::StorageSnapshot>;
 
     fn init(context: Self::Context) -> Self {
         Self {
