@@ -14,16 +14,13 @@
 //! - [`slate`] — the concrete `SlateDbStorage`/`SlateDbStorageSnapshot`/
 //!   `SlateDbStorageReader` wrappers over raw SlateDB types.
 //! - [`factory`] — [`build_storage`]/[`build_reader`] constructors.
-//
-// TODO(phase-3): remove this `allow` once the rest of timeseries is
-// re-anchored onto these types. Until then the module is additive: its items
-// and convenience re-exports have no in-crate users yet.
-#![allow(dead_code, unused_imports)]
-
 pub(crate) mod factory;
 pub(crate) mod slate;
 pub(crate) mod traits;
 
 pub(crate) use factory::{build_reader, build_storage};
-pub(crate) use slate::{SlateDbStorage, SlateDbStorageReader, SlateDbStorageSnapshot};
+pub(crate) use slate::SlateDbStorage;
 pub(crate) use traits::{TsRead, TsSnapshot};
+
+#[cfg(any(test, feature = "testing"))]
+pub(crate) use factory::in_memory_storage;

@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use common::storage::config::{SlateDbStorageConfig, StorageConfig};
+use common::storage::config::SlateDbStorageConfig;
 use common::storage::factory::{build_split_cache, create_object_store};
 use common::storage::metrics_recorder::MetricsRsRecorder;
 use common::storage::slate::SlateDbStorage as CommonSlateDbStorage;
@@ -25,14 +25,13 @@ use super::slate::{SlateDbStorage, SlateDbStorageReader};
 
 /// Builds a read/write [`SlateDbStorage`] from configuration.
 ///
-/// Registers the metrics recorder and, when provided, the merge operator. The
-/// `InMemory` config variant is not supported (Design B uses SlateDb over an
-/// in-memory object store for tests).
+/// Registers the metrics recorder and, when provided, the merge operator.
+/// Timeseries only supports SlateDB, so the config is a [`SlateDbStorageConfig`]
+/// directly (tests use an in-memory object store).
 pub(crate) async fn build_storage(
-    config: &StorageConfig,
+    slate_config: &SlateDbStorageConfig,
     merge_operator: Option<Arc<dyn MergeOperator>>,
 ) -> StorageResult<SlateDbStorage> {
-    let slate_config = require_slatedb(config)?;
     let object_store = create_object_store(&slate_config.object_store)?;
     let settings = load_settings(slate_config)?;
     info!(
@@ -67,12 +66,11 @@ pub(crate) async fn build_storage(
 /// with a live writer. When `checkpoint_id` is set, the reader is pinned to that
 /// checkpoint and does not advance with newer writes.
 pub(crate) async fn build_reader(
-    config: &StorageConfig,
+    slate_config: &SlateDbStorageConfig,
     reader_options: slatedb::config::DbReaderOptions,
     checkpoint_id: Option<Uuid>,
     merge_operator: Option<Arc<dyn MergeOperator>>,
 ) -> StorageResult<SlateDbStorageReader> {
-    let slate_config = require_slatedb(config)?;
     let object_store = create_object_store(&slate_config.object_store)?;
 
     let mut builder = DbReader::builder(slate_config.path.clone(), object_store)
@@ -99,17 +97,6 @@ pub(crate) async fn build_reader(
     Ok(SlateDbStorageReader::new(Arc::new(reader)))
 }
 
-fn require_slatedb(config: &StorageConfig) -> StorageResult<&SlateDbStorageConfig> {
-    match config {
-        StorageConfig::SlateDb(slate_config) => Ok(slate_config),
-        StorageConfig::InMemory => Err(StorageError::Storage(
-            "InMemory storage is not supported by timeseries; use SlateDb with an in-memory \
-             object store"
-                .to_string(),
-        )),
-    }
-}
-
 fn load_settings(slate_config: &SlateDbStorageConfig) -> StorageResult<Settings> {
     match &slate_config.settings_path {
         Some(path) => Settings::from_file(path).map_err(|e| {
@@ -117,6 +104,28 @@ fn load_settings(slate_config: &SlateDbStorageConfig) -> StorageResult<Settings>
         }),
         None => Ok(Settings::load().unwrap_or_default()),
     }
+}
+
+/// Test-only: build a [`SlateDbStorage`] over a fresh in-memory object store,
+/// wired with the OpenTSDB merge operator. Replaces the old `InMemoryStorage`
+/// test backend now that timeseries is SlateDB-native. Each call gets an
+/// isolated object store, so storages do not share state.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) async fn in_memory_storage() -> SlateDbStorage {
+    use common::storage::config::ObjectStoreConfig;
+    let config = SlateDbStorageConfig {
+        path: "test".to_string(),
+        object_store: ObjectStoreConfig::InMemory,
+        settings_path: None,
+        block_cache: None,
+        meta_cache: None,
+    };
+    build_storage(
+        &config,
+        Some(Arc::new(crate::storage::merge_operator::OpenTsdbMergeOperator)),
+    )
+    .await
+    .expect("in-memory SlateDbStorage build failed")
 }
 
 #[cfg(test)]
@@ -143,8 +152,8 @@ mod tests {
         }
     }
 
-    fn slatedb_config_with_local_dir(dir: &std::path::Path) -> StorageConfig {
-        StorageConfig::SlateDb(SlateDbStorageConfig {
+    fn slatedb_config_with_local_dir(dir: &std::path::Path) -> SlateDbStorageConfig {
+        SlateDbStorageConfig {
             path: "data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: dir.to_str().unwrap().to_string(),
@@ -152,13 +161,7 @@ mod tests {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
-        })
-    }
-
-    #[tokio::test]
-    async fn should_reject_in_memory_config() {
-        let result = build_storage(&StorageConfig::InMemory, None).await;
-        assert!(result.is_err());
+        }
     }
 
     #[tokio::test]
@@ -167,7 +170,7 @@ mod tests {
         let cache_dir = tmp.path().join("block-cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
 
-        let config = StorageConfig::SlateDb(SlateDbStorageConfig {
+        let config = SlateDbStorageConfig {
             path: "data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: tmp.path().join("obj").to_str().unwrap().to_string(),
@@ -179,7 +182,7 @@ mod tests {
                 cache_dir.to_str().unwrap().to_string(),
             ))),
             meta_cache: None,
-        });
+        };
 
         let storage = build_storage(&config, None).await;
         assert!(storage.is_ok(), "expected config-driven block cache to work");
@@ -213,13 +216,11 @@ mod tests {
 
         // Open a writer first so the reader has a manifest to read, then drop it
         // (SlateDB fencing) before opening the reader.
-        let writer = build_storage(&StorageConfig::SlateDb(with_cache(&writer_cache)), None)
-            .await
-            .unwrap();
+        let writer = build_storage(&with_cache(&writer_cache), None).await.unwrap();
         drop(writer);
 
         let reader = build_reader(
-            &StorageConfig::SlateDb(with_cache(&reader_cache)),
+            &with_cache(&reader_cache),
             slatedb::config::DbReaderOptions::default(),
             None,
             None,

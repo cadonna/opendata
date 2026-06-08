@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use common::{BytesRange, StorageRead};
+use common::BytesRange;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +18,7 @@ use crate::serde::key::{
     BucketListKey, ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey,
 };
 use crate::storage::OpenTsdbStorageReadExt;
+use crate::storage::backend::TsRead;
 
 const LOG_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -37,7 +38,7 @@ impl CacheWarmerHandle {
 
 /// Spawns a one-off cache warming task. Returns a handle that must be
 /// shut down before closing the database.
-pub(crate) fn start(storage: Arc<dyn StorageRead>, config: CacheWarmerConfig) -> CacheWarmerHandle {
+pub(crate) fn start(storage: Arc<dyn TsRead>, config: CacheWarmerConfig) -> CacheWarmerHandle {
     let cancel = CancellationToken::new();
     let join = tokio::spawn({
         let cancel = cancel.clone();
@@ -63,7 +64,7 @@ struct WarmStats {
 }
 
 async fn warm(
-    storage: &Arc<dyn StorageRead>,
+    storage: &Arc<dyn TsRead>,
     config: &CacheWarmerConfig,
     cancel: &CancellationToken,
 ) -> crate::util::Result<WarmStats> {
@@ -120,7 +121,7 @@ async fn warm(
 
 /// Scan a key range, consuming all records to populate the block cache.
 /// Returns the number of records touched.
-async fn drain_scan(storage: &Arc<dyn StorageRead>, range: BytesRange) -> crate::util::Result<u64> {
+async fn drain_scan(storage: &Arc<dyn TsRead>, range: BytesRange) -> crate::util::Result<u64> {
     let mut iter = storage.scan_iter(range).await?;
     let mut count = 0u64;
     while iter.next().await?.is_some() {
@@ -133,20 +134,17 @@ async fn drain_scan(storage: &Arc<dyn StorageRead>, range: BytesRange) -> crate:
 mod tests {
     use super::*;
     use crate::model::Series;
-    use crate::storage::merge_operator::OpenTsdbMergeOperator;
+    use crate::storage::backend::{SlateDbStorage, in_memory_storage};
     use crate::tsdb::Tsdb;
-    use common::storage::in_memory::InMemoryStorage;
 
-    fn create_storage() -> Arc<InMemoryStorage> {
-        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )))
+    async fn create_storage() -> Arc<SlateDbStorage> {
+        Arc::new(in_memory_storage().await)
     }
 
     #[tokio::test]
     async fn should_warm_with_data() {
         // given
-        let storage = create_storage();
+        let storage = create_storage().await;
         let tsdb = Tsdb::new(storage.clone());
         let series = vec![
             Series::builder("http_requests_total")
@@ -170,7 +168,7 @@ mod tests {
 
         // when
         let cancel = CancellationToken::new();
-        let stats = warm(&(storage as Arc<dyn StorageRead>), &config, &cancel)
+        let stats = warm(&(storage as Arc<dyn TsRead>), &config, &cancel)
             .await
             .unwrap();
 
@@ -182,7 +180,7 @@ mod tests {
     #[tokio::test]
     async fn should_warm_empty_storage() {
         // given
-        let storage = create_storage();
+        let storage = create_storage().await;
         let config = CacheWarmerConfig {
             warm_range: Duration::from_secs(3600),
             include_samples: true,
@@ -190,7 +188,7 @@ mod tests {
 
         // when
         let cancel = CancellationToken::new();
-        let stats = warm(&(storage as Arc<dyn StorageRead>), &config, &cancel)
+        let stats = warm(&(storage as Arc<dyn TsRead>), &config, &cancel)
             .await
             .unwrap();
 
@@ -202,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn should_stop_on_cancellation() {
         // given
-        let storage = create_storage();
+        let storage = create_storage().await;
         let tsdb = Tsdb::new(storage.clone());
         let series = vec![
             Series::builder("metric_a")
@@ -227,7 +225,7 @@ mod tests {
         // when — cancel before starting
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let stats = warm(&(storage as Arc<dyn StorageRead>), &config, &cancel)
+        let stats = warm(&(storage as Arc<dyn TsRead>), &config, &cancel)
             .await
             .unwrap();
 

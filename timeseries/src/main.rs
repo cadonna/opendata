@@ -32,7 +32,7 @@ mod util;
 use std::sync::Arc;
 
 use clap::Parser;
-use common::{StorageBuilder, StorageSemantics};
+use storage::backend::build_storage;
 
 use promql::config::{CliArgs, PrometheusConfig, load_config};
 use reader::TimeSeriesDbReader;
@@ -120,22 +120,17 @@ async fn main() {
         engine
     } else {
         // Read-write mode: open full storage + Tsdb
-        let merge_operator = Arc::new(OpenTsdbMergeOperator);
-        let storage = StorageBuilder::new(&prometheus_config.storage)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!("Failed to create storage: {}", e);
-                std::process::exit(1);
-            })
-            .with_semantics(StorageSemantics::new().with_merge_operator(merge_operator))
-            .build()
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!("Failed to create storage: {}", e);
-                std::process::exit(1);
-            });
+        let storage = build_storage(
+            &prometheus_config.storage,
+            Some(Arc::new(OpenTsdbMergeOperator)),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to create storage: {}", e);
+            std::process::exit(1);
+        });
         tracing::info!("Storage created successfully");
-        Arc::new(Arc::new(Tsdb::new(storage)).into())
+        Arc::new(Arc::new(Tsdb::new(Arc::new(storage))).into())
     };
 
     // Create server configuration

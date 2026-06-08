@@ -1,7 +1,9 @@
 use async_trait::async_trait;
+use common::Record;
 use common::storage::{MergeOptions, MergeRecordOp, PutOptions, PutRecordOp, RecordOp, Ttl};
-use common::{Record, Storage, StorageRead};
 use roaring::RoaringBitmap;
+
+use crate::storage::backend::{SlateDbStorage, TsRead};
 
 use crate::index::{InvertedIndex, SeriesSpec};
 use crate::model::{Sample, SeriesFingerprint, SeriesId, TimeBucket};
@@ -24,9 +26,9 @@ use crate::{
 pub(crate) mod backend;
 pub(crate) mod merge_operator;
 
-/// Extension trait for StorageRead that provides OpenTSDB-specific loading methods
+/// Extension trait for [`TsRead`] that provides OpenTSDB-specific loading methods
 #[async_trait]
-pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
+pub(crate) trait OpenTsdbStorageReadExt: TsRead {
     /// Given a time range, return all the time buckets that contain data for
     /// that range sorted by start time.
     ///
@@ -328,10 +330,10 @@ pub(crate) trait OpenTsdbStorageReadExt: StorageRead {
     }
 }
 
-// Implement the trait for all types that implement StorageRead
-impl<T: ?Sized + StorageRead> OpenTsdbStorageReadExt for T {}
+// Implement the trait for all types that implement TsRead
+impl<T: ?Sized + TsRead> OpenTsdbStorageReadExt for T {}
 
-pub(crate) trait OpenTsdbStorageExt: Storage {
+pub(crate) trait OpenTsdbStorageExt: TsRead {
     fn merge_bucket_list(&self, bucket: TimeBucket, ttl: Ttl) -> Result<RecordOp> {
         let key = BucketListKey.encode();
         let value = BucketListValue {
@@ -435,8 +437,8 @@ pub(crate) trait OpenTsdbStorageExt: Storage {
     }
 }
 
-// Implement the trait for all types that implement Storage
-impl<T: ?Sized + Storage> OpenTsdbStorageExt for T {}
+// The writer is always the concrete SlateDbStorage; these are pure op builders.
+impl OpenTsdbStorageExt for SlateDbStorage {}
 
 /// Read the current `BucketList` value and rewrite it as a single `Put`,
 /// collapsing the merge chain that accrues across ingestion batches into
@@ -444,7 +446,7 @@ impl<T: ?Sized + Storage> OpenTsdbStorageExt for T {}
 /// begins, so later reads don't have to replay operands scattered across
 /// SSTs. Safe only when there are no concurrent writers.
 #[tracing::instrument(level = "info", skip_all)]
-pub(crate) async fn coalesce_bucket_list(storage: &dyn Storage) -> Result<()> {
+pub(crate) async fn coalesce_bucket_list(storage: &SlateDbStorage) -> Result<()> {
     let key = BucketListKey.encode();
     let Some(record) = storage.get(key.clone()).await? else {
         return Ok(());
@@ -461,17 +463,14 @@ pub(crate) async fn coalesce_bucket_list(storage: &dyn Storage) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::merge_operator::OpenTsdbMergeOperator;
+    use crate::storage::backend::in_memory_storage;
     use common::storage::PutRecordOp;
-    use common::storage::in_memory::InMemoryStorage;
     use std::sync::Arc;
 
-    /// Create an InMemoryStorage with the given hour-buckets pre-populated.
+    /// Create a SlateDb storage with the given hour-buckets pre-populated.
     /// Each entry in `bucket_starts` is the bucket start in minutes.
-    async fn storage_with_buckets(bucket_starts: &[u32]) -> Arc<InMemoryStorage> {
-        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )));
+    async fn storage_with_buckets(bucket_starts: &[u32]) -> Arc<SlateDbStorage> {
+        let storage = Arc::new(in_memory_storage().await);
         let buckets: Vec<(u8, u32)> = bucket_starts.iter().map(|&s| (1u8, s)).collect();
         let key = BucketListKey.encode();
         let value = BucketListValue { buckets }.encode();
@@ -580,9 +579,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_false_when_bucket_list_key_missing() {
         // given
-        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )));
+        let storage = Arc::new(in_memory_storage().await);
 
         // when
         let present = storage
@@ -619,9 +616,7 @@ mod tests {
     #[tokio::test]
     async fn should_coalesce_bucket_list_preserving_merged_value() {
         // given: several merge operands have accrued on the BucketList key
-        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )));
+        let storage = Arc::new(in_memory_storage().await);
         let ops = vec![
             storage
                 .merge_bucket_list(TimeBucket { size: 1, start: 0 }, Ttl::Default)
@@ -652,9 +647,7 @@ mod tests {
     #[tokio::test]
     async fn should_be_noop_when_bucket_list_absent() {
         // given
-        let storage = Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )));
+        let storage = Arc::new(in_memory_storage().await);
 
         // when
         coalesce_bucket_list(storage.as_ref()).await.unwrap();
