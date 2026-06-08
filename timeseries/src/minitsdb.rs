@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig, WriteError};
-use common::storage::StorageSnapshot;
-use common::{Storage, StorageRead};
+
+use crate::storage::backend::{SlateDbStorage, TsRead, TsSnapshot};
 
 const WRITE_CHANNEL: &str = "write";
 
@@ -23,11 +23,11 @@ use crate::util::Result;
 
 pub(crate) struct MiniQueryReader {
     bucket: TimeBucket,
-    snapshot: Arc<dyn StorageRead>,
+    snapshot: Arc<dyn TsRead>,
 }
 
 impl MiniQueryReader {
-    pub(crate) fn new(bucket: TimeBucket, storage: Arc<dyn StorageRead>) -> Self {
+    pub(crate) fn new(bucket: TimeBucket, storage: Arc<dyn TsRead>) -> Self {
         Self {
             bucket,
             snapshot: storage,
@@ -192,13 +192,13 @@ impl MiniTsdb {
         let view = self.write_coordinator.view();
         MiniQueryReader {
             bucket: self.bucket,
-            snapshot: view.snapshot.clone(),
+            snapshot: view.snapshot.clone() as Arc<dyn TsRead>,
         }
     }
 
     pub(crate) async fn load(
         bucket: TimeBucket,
-        storage: Arc<dyn Storage>,
+        storage: Arc<SlateDbStorage>,
         retention: Option<Duration>,
         active_series: Arc<ActiveSeriesTracker>,
     ) -> Result<Self> {
@@ -224,7 +224,7 @@ impl MiniTsdb {
             active_series,
         };
 
-        let initial_snapshot: Arc<dyn StorageSnapshot> = storage
+        let initial_snapshot: Arc<dyn TsSnapshot> = storage
             .snapshot()
             .await
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -352,7 +352,7 @@ mod tests {
     /// Create a MiniTsdb with a custom queue capacity.
     async fn load_with_config(
         bucket: TimeBucket,
-        storage: Arc<dyn Storage>,
+        storage: Arc<SlateDbStorage>,
         queue_capacity: usize,
     ) -> MiniTsdb {
         let snapshot = storage.snapshot().await.unwrap();
@@ -379,7 +379,7 @@ mod tests {
             active_series,
         };
 
-        let initial_snapshot: Arc<dyn StorageSnapshot> = storage.snapshot().await.unwrap();
+        let initial_snapshot: Arc<dyn TsSnapshot> = storage.snapshot().await.unwrap();
 
         let config = WriteCoordinatorConfig {
             queue_capacity,
@@ -409,19 +409,8 @@ mod tests {
         )
     }
 
-    async fn test_storage() -> Arc<dyn Storage> {
-        use crate::storage::merge_operator::OpenTsdbMergeOperator;
-        use common::{StorageBuilder, StorageConfig, StorageSemantics};
-
-        StorageBuilder::new(&StorageConfig::InMemory)
-            .await
-            .unwrap()
-            .with_semantics(
-                StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
-            )
-            .build()
-            .await
-            .unwrap()
+    async fn test_storage() -> Arc<SlateDbStorage> {
+        Arc::new(crate::storage::backend::in_memory_storage().await)
     }
 
     #[tokio::test]

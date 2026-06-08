@@ -11,10 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use common::StorageConfig;
-use common::StorageRead;
-use common::storage::factory::create_storage_read;
-use common::{StorageReaderRuntime, StorageSemantics};
+use common::storage::config::SlateDbStorageConfig;
 use futures::stream::{self, StreamExt};
 use moka::future::Cache;
 use uuid::Uuid;
@@ -27,6 +24,7 @@ use crate::model::{
 };
 use crate::query::{BucketQueryReader, QueryReader};
 use crate::storage::OpenTsdbStorageReadExt;
+use crate::storage::backend::{TsRead, build_reader};
 use crate::storage::merge_operator::OpenTsdbMergeOperator;
 use crate::tsdb::{
     TsdbReadEngine, find_label_values_in_range, find_labels_in_range, find_series_in_range,
@@ -166,7 +164,7 @@ impl QueryReader for ReaderQueryReader {
 /// let result = reader.query("rate(http_requests_total[5m])", None).await?;
 /// ```
 pub struct TimeSeriesDbReader {
-    storage: Arc<dyn StorageRead>,
+    storage: Arc<dyn TsRead>,
     /// LRU cache for read-only query buckets.
     query_cache: Cache<TimeBucket, Arc<MiniQueryReader>>,
 }
@@ -181,7 +179,7 @@ impl TimeSeriesDbReader {
     ///
     /// Returns an error if the storage backend cannot be initialized.
     pub async fn open(
-        storage_config: StorageConfig,
+        storage_config: SlateDbStorageConfig,
         reader_options: slatedb::config::DbReaderOptions,
         cache_capacity: u64,
     ) -> Result<Self> {
@@ -195,7 +193,7 @@ impl TimeSeriesDbReader {
     /// writes. The checkpoint must already exist (typically created via
     /// `TimeSeriesDb::create_checkpoint`).
     pub async fn open_at_checkpoint(
-        storage_config: StorageConfig,
+        storage_config: SlateDbStorageConfig,
         reader_options: slatedb::config::DbReaderOptions,
         cache_capacity: u64,
         checkpoint_id: Uuid,
@@ -210,31 +208,30 @@ impl TimeSeriesDbReader {
     }
 
     async fn open_inner(
-        storage_config: StorageConfig,
+        storage_config: SlateDbStorageConfig,
         reader_options: slatedb::config::DbReaderOptions,
         cache_capacity: u64,
         checkpoint_id: Option<Uuid>,
     ) -> Result<Self> {
-        let mut runtime = StorageReaderRuntime::new();
-        if let Some(id) = checkpoint_id {
-            runtime = runtime.with_checkpoint_id(id);
-        }
-        let storage = create_storage_read(
+        let reader = build_reader(
             &storage_config,
-            runtime,
-            StorageSemantics::new().with_merge_operator(Arc::new(OpenTsdbMergeOperator)),
             reader_options,
+            checkpoint_id,
+            Some(Arc::new(OpenTsdbMergeOperator)),
         )
         .await?;
-        Ok(Self::from_storage_with_capacity(storage, cache_capacity))
+        Ok(Self::from_storage_with_capacity(
+            Arc::new(reader),
+            cache_capacity,
+        ))
     }
 
     /// Creates a TimeSeriesDbReader from an existing storage implementation.
-    pub(crate) fn from_storage(storage: Arc<dyn StorageRead>) -> Self {
+    pub(crate) fn from_storage(storage: Arc<dyn TsRead>) -> Self {
         Self::from_storage_with_capacity(storage, DEFAULT_CACHE_CAPACITY)
     }
 
-    fn from_storage_with_capacity(storage: Arc<dyn StorageRead>, cache_capacity: u64) -> Self {
+    fn from_storage_with_capacity(storage: Arc<dyn TsRead>, cache_capacity: u64) -> Self {
         let query_cache = Cache::builder().max_capacity(cache_capacity).build();
         Self {
             storage,
@@ -244,7 +241,7 @@ impl TimeSeriesDbReader {
 
     /// Returns a read handle to the underlying storage, for background tasks
     /// like the cache warmer.
-    pub(crate) fn storage_read(&self) -> Arc<dyn StorageRead> {
+    pub(crate) fn storage_read(&self) -> Arc<dyn TsRead> {
         self.storage.clone()
     }
 
@@ -377,19 +374,16 @@ impl TsdbReadEngine for TimeSeriesDbReader {
 mod tests {
     use super::*;
     use crate::model::Series;
-    use crate::storage::merge_operator::OpenTsdbMergeOperator;
-    use common::storage::in_memory::InMemoryStorage;
+    use crate::storage::backend::{SlateDbStorage, in_memory_storage};
 
-    fn create_shared_storage() -> Arc<InMemoryStorage> {
-        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )))
+    async fn create_shared_storage() -> Arc<SlateDbStorage> {
+        Arc::new(in_memory_storage().await)
     }
 
     #[tokio::test]
     async fn reader_sees_written_data() {
         // Write data through internal Tsdb, then verify reader sees it.
-        let storage = create_shared_storage();
+        let storage = create_shared_storage().await;
 
         let tsdb = crate::tsdb::Tsdb::new(storage.clone());
         let series = vec![
@@ -424,7 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn reader_series_discovery() {
-        let storage = create_shared_storage();
+        let storage = create_shared_storage().await;
 
         let tsdb = crate::tsdb::Tsdb::new(storage.clone());
         let series = vec![
@@ -488,7 +482,7 @@ mod tests {
     async fn writer_and_reader_coexist_on_shared_storage() {
         // Verify that a writer and reader can both operate on the same
         // InMemoryStorage without interfering with each other.
-        let storage = create_shared_storage();
+        let storage = create_shared_storage().await;
 
         let tsdb = crate::tsdb::Tsdb::new(storage.clone());
 
@@ -537,7 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn reader_query_range() {
-        let storage = create_shared_storage();
+        let storage = create_shared_storage().await;
 
         let tsdb = crate::tsdb::Tsdb::new(storage.clone());
         let series = vec![
@@ -584,7 +578,7 @@ mod tests {
         };
 
         let tmp_dir = tempfile::tempdir().unwrap();
-        let storage_config = common::StorageConfig::SlateDb(SlateDbStorageConfig {
+        let storage_config = SlateDbStorageConfig {
             path: "data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
@@ -592,7 +586,7 @@ mod tests {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
-        });
+        };
 
         // 1. Open writer and write data
         let writer = TimeSeriesDb::open(Config {
@@ -699,7 +693,7 @@ mod tests {
 
         // given
         let tmp_dir = tempfile::tempdir().unwrap();
-        let storage_config = common::StorageConfig::SlateDb(SlateDbStorageConfig {
+        let storage_config = SlateDbStorageConfig {
             path: "data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
@@ -707,7 +701,7 @@ mod tests {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
-        });
+        };
 
         let writer = TimeSeriesDb::open(Config {
             storage: storage_config.clone(),
@@ -760,7 +754,7 @@ mod tests {
     async fn writer_and_reader_query_range_parity_at_boundary() {
         use crate::model::QueryOptions;
 
-        let storage = create_shared_storage();
+        let storage = create_shared_storage().await;
         let tsdb = crate::tsdb::Tsdb::new(storage.clone());
 
         // 5 samples at 15s intervals: t+0, t+15, t+30, t+45, t+60
@@ -826,7 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_range_rejects_zero_step() {
-        let storage = create_shared_storage();
+        let storage = create_shared_storage().await;
 
         let tsdb = crate::tsdb::Tsdb::new(storage.clone());
         let series = vec![
@@ -869,7 +863,7 @@ mod tests {
 
         // given
         let tmp_dir = tempfile::tempdir().unwrap();
-        let storage_config = common::StorageConfig::SlateDb(SlateDbStorageConfig {
+        let storage_config = SlateDbStorageConfig {
             path: "data".to_string(),
             object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
                 path: tmp_dir.path().to_str().unwrap().to_string(),
@@ -877,7 +871,7 @@ mod tests {
             settings_path: None,
             block_cache: None,
             meta_cache: None,
-        });
+        };
 
         let writer = TimeSeriesDb::open(Config {
             storage: storage_config.clone(),
@@ -964,9 +958,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn from_storage_uses_default_cache_capacity() {
-        let storage = create_shared_storage();
+    #[tokio::test]
+    async fn from_storage_uses_default_cache_capacity() {
+        let storage = create_shared_storage().await;
         let reader = TimeSeriesDbReader::from_storage(storage);
         assert_eq!(
             reader.query_cache.policy().max_capacity(),
@@ -974,9 +968,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn from_storage_with_capacity_honors_custom_value() {
-        let storage = create_shared_storage();
+    #[tokio::test]
+    async fn from_storage_with_capacity_honors_custom_value() {
+        let storage = create_shared_storage().await;
         let reader = TimeSeriesDbReader::from_storage_with_capacity(storage, 123);
         assert_eq!(reader.query_cache.policy().max_capacity(), Some(123));
     }

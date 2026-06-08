@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::coordinator::Flusher;
-use common::storage::{RecordOp, Storage, StorageSnapshot, Ttl};
+use common::storage::{RecordOp, Ttl};
 
 use crate::active_series::{ActiveSeriesTracker, current_unix_minute};
 use crate::delta::{FrozenTsdbDelta, TsdbWriteDelta};
 use crate::model::TimeBucket;
+use crate::storage::backend::{SlateDbStorage, TsSnapshot};
 use crate::storage::{OpenTsdbStorageExt, OpenTsdbStorageReadExt};
 use crate::tsdb_metrics;
 
@@ -28,7 +29,7 @@ fn op_estimated_bytes(op: &RecordOp) -> usize {
 /// Converts a `FrozenTsdbDelta` into storage operations and applies them
 /// atomically, then returns a new snapshot for readers.
 pub(crate) struct TsdbFlusher {
-    pub(crate) storage: Arc<dyn Storage>,
+    pub(crate) storage: Arc<SlateDbStorage>,
     /// Optional retention duration. When set, every record produced by a flush
     /// is stamped with the same `Ttl::ExpireAt(bucket_start_ms + retention_ms)`
     /// so SlateDB can collapse merge operands during compaction. Without a
@@ -58,7 +59,7 @@ impl Flusher<TsdbWriteDelta> for TsdbFlusher {
         &mut self,
         frozen: FrozenTsdbDelta,
         _epoch_range: &Range<u64>,
-    ) -> Result<Arc<dyn StorageSnapshot>, String> {
+    ) -> Result<Arc<dyn TsSnapshot>, String> {
         // Advance the active-series ring to the current minute and republish
         // the gauge. Done unconditionally (even on empty deltas) so the window
         // continues to slide for idle workloads.
@@ -211,16 +212,13 @@ mod tests {
     use crate::serde::bucket_list::BucketListValue;
     use crate::serde::key::BucketListKey;
     use crate::storage::OpenTsdbStorageReadExt;
-    use crate::storage::merge_operator::OpenTsdbMergeOperator;
+    use crate::storage::backend::{SlateDbStorage, in_memory_storage};
     use common::Record;
     use common::coordinator::Delta;
-    use common::storage::in_memory::InMemoryStorage;
     use std::collections::HashMap;
 
-    fn create_test_storage() -> Arc<dyn Storage> {
-        Arc::new(InMemoryStorage::with_merge_operator(Arc::new(
-            OpenTsdbMergeOperator,
-        )))
+    async fn create_test_storage() -> Arc<SlateDbStorage> {
+        Arc::new(in_memory_storage().await)
     }
 
     fn create_test_bucket() -> TimeBucket {
@@ -288,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn should_flush_delta_to_storage() {
         // given
-        let storage = create_test_storage();
+        let storage = create_test_storage().await;
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
@@ -318,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn should_skip_empty_delta() {
         // given
-        let storage = create_test_storage();
+        let storage = create_test_storage().await;
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
@@ -343,11 +341,6 @@ mod tests {
         assert_eq!(buckets.len(), 0);
     }
 
-    fn create_failing_storage() -> Arc<common::storage::in_memory::FailingStorage> {
-        let inner = create_test_storage();
-        common::storage::in_memory::FailingStorage::wrap(inner)
-    }
-
     fn create_non_empty_frozen() -> FrozenTsdbDelta {
         let ctx = TsdbContext {
             bucket: create_test_bucket(),
@@ -363,81 +356,16 @@ mod tests {
         frozen
     }
 
-    #[tokio::test]
-    async fn should_propagate_apply_error() {
-        // given
-        let storage = create_failing_storage();
-        let mut flusher = TsdbFlusher {
-            storage: storage.clone(),
-            retention: None,
-            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
-        };
-        storage.fail_apply(common::StorageError::Storage("test apply error".into()));
-
-        // when
-        let result = flusher
-            .flush_delta(create_non_empty_frozen(), &(1..2))
-            .await;
-
-        // then
-        let err = result.err().expect("expected apply error");
-        assert!(
-            err.contains("test apply error"),
-            "expected test apply error message, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn should_propagate_snapshot_error_after_apply() {
-        // given
-        let storage = create_failing_storage();
-        let mut flusher = TsdbFlusher {
-            storage: storage.clone(),
-            retention: None,
-            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
-        };
-        // Apply succeeds, but snapshot after apply fails
-        storage.fail_snapshot(common::StorageError::Storage("test snapshot error".into()));
-
-        // when
-        let result = flusher
-            .flush_delta(create_non_empty_frozen(), &(1..2))
-            .await;
-
-        // then
-        let err = result.err().expect("expected snapshot error");
-        assert!(
-            err.contains("test snapshot error"),
-            "expected test snapshot error message, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn should_propagate_flush_storage_error() {
-        // given
-        let storage = create_failing_storage();
-        let flusher = TsdbFlusher {
-            storage: storage.clone(),
-            retention: None,
-            active_series: ::std::sync::Arc::new(crate::active_series::ActiveSeriesTracker::new(0)),
-        };
-        storage.fail_flush(common::StorageError::Storage("test flush error".into()));
-
-        // when
-        let result = flusher.flush_storage().await;
-
-        // then
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("test flush error"),
-            "expected test flush error message"
-        );
-    }
+    // NOTE: storage-fault-injection tests (apply/snapshot/flush error
+    // propagation) were removed when timeseries moved to a concrete native
+    // SlateDbStorage writer — there is no longer a mockable `Storage` trait to
+    // wrap with a failing implementation. The error-mapping paths are still
+    // covered by `storage::backend::slate` and the coordinator's flush handling.
 
     #[tokio::test]
     async fn should_register_bucket_on_first_flush() {
         // given
-        let storage = create_test_storage();
+        let storage = create_test_storage().await;
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
@@ -470,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn should_not_duplicate_bucket_across_multiple_flushes() {
         // given: two back-to-back flushes for the same bucket
-        let storage = create_test_storage();
+        let storage = create_test_storage().await;
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,
@@ -511,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn should_skip_bucket_list_merge_when_bucket_already_present() {
         // given: storage pre-populated with the bucket in the BucketList
-        let storage = create_test_storage();
+        let storage = create_test_storage().await;
         let bucket = create_test_bucket();
         let pre_existing = BucketListValue {
             buckets: vec![(bucket.size, bucket.start)],
@@ -557,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn should_persist_series_dict_entries() {
         // given
-        let storage = create_test_storage();
+        let storage = create_test_storage().await;
         let mut flusher = TsdbFlusher {
             storage: storage.clone(),
             retention: None,

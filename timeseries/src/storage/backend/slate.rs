@@ -23,7 +23,6 @@ use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
 use slatedb::{
     Db, DbIterator, DbReader, DbSnapshot, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
-use tracing::warn;
 
 use super::traits::{TsRead, TsSnapshot};
 
