@@ -1,40 +1,29 @@
 //! Native SlateDB storage backend for timeseries.
 //!
-//! This module replaces timeseries' dependency on `common::storage`. It owns
-//! the SlateDB integration directly:
+//! This module replaces timeseries' use of the `common::storage` *handles*
+//! (`Storage`/`StorageRead`/`StorageSnapshot`) with a direct SlateDB
+//! integration. Everything reusable — value types (`Record`, `RecordOp`,
+//! `Ttl`, …), the iterator and merge-operator traits, the error type, the
+//! config types, the object-store / foyer-cache / metrics-recorder plumbing,
+//! and the `Ttl`/options → SlateDB conversions — is reused from
+//! `common::storage` rather than duplicated.
 //!
-//! - [`ops`] — plain value types (`Record`, `RecordOp`, `Ttl`, …) and the
-//!   storage error type.
 //! - [`traits`] — the minimal [`TsRead`]/[`TsSnapshot`] read abstraction that
 //!   unifies the three SlateDB read backends. Writes use inherent methods on
 //!   the concrete [`SlateDbStorage`].
-//! - [`config`] — serde config types (kept compatible with existing YAML).
-//! - [`factory`] — [`build_storage`]/[`build_reader`] constructors plus object
-//!   store and foyer block-cache wiring.
-//! - [`metrics`] — bridges SlateDB/foyer metrics into the `metrics` crate.
 //! - [`slate`] — the concrete `SlateDbStorage`/`SlateDbStorageSnapshot`/
-//!   `SlateDbStorageReader` and their `TsRead` impls.
+//!   `SlateDbStorageReader` wrappers over raw SlateDB types.
+//! - [`factory`] — [`build_storage`]/[`build_reader`] constructors.
 //
-// TODO(phase-3): remove these `allow`s once the rest of timeseries is
+// TODO(phase-3): remove this `allow` once the rest of timeseries is
 // re-anchored onto these types. Until then the module is additive: its items
 // and convenience re-exports have no in-crate users yet.
 #![allow(dead_code, unused_imports)]
 
-pub(crate) mod config;
 pub(crate) mod factory;
-pub(crate) mod metrics;
-pub(crate) mod ops;
 pub(crate) mod slate;
 pub(crate) mod traits;
 
-pub(crate) use config::{
-    AwsObjectStoreConfig, BlockCacheConfig, FoyerHybridCacheConfig, FoyerWritePolicy,
-    LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig,
-};
-pub(crate) use factory::{SlateMergeOperator, build_reader, build_storage, create_object_store};
-pub(crate) use ops::{
-    CheckpointInfo, MergeOptions, MergeRecordOp, PutOptions, PutRecordOp, Record, RecordOp,
-    StorageError, StorageResult, Ttl, WriteOptions, WriteResult,
-};
+pub(crate) use factory::{build_reader, build_storage};
 pub(crate) use slate::{SlateDbStorage, SlateDbStorageReader, SlateDbStorageSnapshot};
-pub(crate) use traits::{TsIterator, TsRead, TsSnapshot};
+pub(crate) use traits::{TsRead, TsSnapshot};

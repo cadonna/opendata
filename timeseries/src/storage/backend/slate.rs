@@ -4,26 +4,28 @@
 //! writes via inherent methods (the writer is always concrete, so no write
 //! trait is needed). [`SlateDbStorageSnapshot`] and [`SlateDbStorageReader`]
 //! wrap `DbSnapshot` and `DbReader` and provide read-only access via [`TsRead`].
+//!
+//! Value types (`Record`, `RecordOp`, `Ttl`, …), the iterator trait, the error
+//! type, and the `Ttl`/options → SlateDB conversions are all reused from
+//! `common::storage`; only the storage *handles* are native here.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::BytesRange;
+use common::storage::{
+    CheckpointInfo, MergeRecordOp, PutRecordOp, Record, RecordOp, StorageError, StorageIterator,
+    StorageResult, WriteOptions, WriteResult,
+};
 use slatedb::IterationOrder;
 use slatedb::config::{CheckpointOptions, CheckpointScope, ScanOptions};
 use slatedb::{
     Db, DbIterator, DbReader, DbSnapshot, WriteBatch, config::WriteOptions as SlateDbWriteOptions,
 };
-use tokio::sync::watch;
 use tracing::warn;
 
-use super::factory::OwnedHybridCache;
-use super::ops::{
-    CheckpointInfo, MergeOptions, MergeRecordOp, PutOptions, PutRecordOp, Record, RecordOp,
-    StorageError, StorageResult, Ttl, WriteOptions, WriteResult,
-};
-use super::traits::{TsIterator, TsRead, TsSnapshot};
+use super::traits::{TsRead, TsSnapshot};
 
 /// Returns the default scan options used for storage scans.
 fn default_scan_options() -> ScanOptions {
@@ -42,59 +44,24 @@ fn default_scan_options() -> ScanOptions {
 ///
 /// SlateDB is an embedded key-value store built on object storage, providing
 /// LSM-tree semantics with cloud-native durability.
-pub struct SlateDbStorage {
+pub(crate) struct SlateDbStorage {
     pub(crate) db: Arc<Db>,
-    durable_tx: watch::Sender<u64>,
-    durable_bridge_abort: tokio::task::AbortHandle,
-    // TODO(slatedb 0.13): remove once DbCache exposes a close() hook and
-    // Db::close() drives cache shutdown itself.
-    managed_cache: Option<OwnedHybridCache>,
 }
 
 impl SlateDbStorage {
     /// Creates a new `SlateDbStorage` wrapping the given SlateDB database.
-    pub fn new(db: Arc<Db>) -> Self {
-        Self::new_with_managed_cache(db, None)
-    }
-
-    /// Creates a `SlateDbStorage` that will explicitly close the given foyer
-    /// hybrid cache during [`TsRead::close`]. See [`OwnedHybridCache`].
-    pub(crate) fn new_with_managed_cache(
-        db: Arc<Db>,
-        managed_cache: Option<OwnedHybridCache>,
-    ) -> Self {
-        let slate_rx = db.subscribe();
-        let (durable_tx, _) = watch::channel(slate_rx.borrow().durable_seq);
-        let task = tokio::spawn({
-            let tx = durable_tx.clone();
-            async move {
-                let mut slate_rx = slate_rx;
-                while slate_rx.changed().await.is_ok() {
-                    let durable_seq = slate_rx.borrow_and_update().durable_seq;
-                    // send_replace (not send): SlateDB may publish a status
-                    // change during `open` before any consumer subscribes, and
-                    // `send` would Err on zero receivers — killing the bridge.
-                    tx.send_replace(durable_seq);
-                }
-            }
-        });
-
-        Self {
-            db,
-            durable_tx,
-            durable_bridge_abort: task.abort_handle(),
-            managed_cache,
-        }
+    pub(crate) fn new(db: Arc<Db>) -> Self {
+        Self { db }
     }
 
     /// Applies a batch of mixed operations atomically with default options
     /// (`await_durable: false`).
-    pub async fn apply(&self, ops: Vec<RecordOp>) -> StorageResult<WriteResult> {
+    pub(crate) async fn apply(&self, ops: Vec<RecordOp>) -> StorageResult<WriteResult> {
         self.apply_with_options(ops, WriteOptions::default()).await
     }
 
     /// Applies a batch of mixed operations atomically with custom options.
-    pub async fn apply_with_options(
+    pub(crate) async fn apply_with_options(
         &self,
         records: Vec<RecordOp>,
         options: WriteOptions,
@@ -115,13 +82,13 @@ impl SlateDbStorage {
     }
 
     /// Writes records with default options (`await_durable: false`).
-    pub async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<WriteResult> {
+    pub(crate) async fn put(&self, records: Vec<PutRecordOp>) -> StorageResult<WriteResult> {
         self.put_with_options(records, WriteOptions::default())
             .await
     }
 
     /// Writes records with custom options controlling durability.
-    pub async fn put_with_options(
+    pub(crate) async fn put_with_options(
         &self,
         records: Vec<PutRecordOp>,
         options: WriteOptions,
@@ -134,14 +101,14 @@ impl SlateDbStorage {
     }
 
     /// Merges records using the configured merge operator, default options.
-    pub async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<WriteResult> {
+    pub(crate) async fn merge(&self, records: Vec<MergeRecordOp>) -> StorageResult<WriteResult> {
         self.merge_with_options(records, WriteOptions::default())
             .await
     }
 
     /// Merges records with custom options. Returns a clear error if no merge
     /// operator is configured on the database.
-    pub async fn merge_with_options(
+    pub(crate) async fn merge_with_options(
         &self,
         records: Vec<MergeRecordOp>,
         options: WriteOptions,
@@ -193,7 +160,7 @@ impl SlateDbStorage {
     }
 
     /// Creates a point-in-time snapshot for consistent reads.
-    pub async fn snapshot(&self) -> StorageResult<Arc<dyn TsSnapshot>> {
+    pub(crate) async fn snapshot(&self) -> StorageResult<Arc<dyn TsSnapshot>> {
         let snapshot = self
             .db
             .snapshot()
@@ -203,18 +170,13 @@ impl SlateDbStorage {
     }
 
     /// Flushes pending writes to durable storage.
-    pub async fn flush(&self) -> StorageResult<()> {
+    pub(crate) async fn flush(&self) -> StorageResult<()> {
         self.db.flush().await.map_err(StorageError::from_storage)?;
         Ok(())
     }
 
-    /// Subscribes to the durable sequence watermark (`DbStatus::durable_seq`).
-    pub fn subscribe_durable(&self) -> watch::Receiver<u64> {
-        self.durable_tx.subscribe()
-    }
-
     /// Creates a durable checkpoint covering all data.
-    pub async fn create_checkpoint(&self) -> StorageResult<CheckpointInfo> {
+    pub(crate) async fn create_checkpoint(&self) -> StorageResult<CheckpointInfo> {
         let result = self
             .db
             .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
@@ -246,7 +208,7 @@ impl TsRead for SlateDbStorage {
     async fn scan_iter(
         &self,
         range: BytesRange,
-    ) -> StorageResult<Box<dyn TsIterator + Send + 'static>> {
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let iter = self
             .db
             .scan_with_options(range, &default_scan_options())
@@ -256,17 +218,7 @@ impl TsRead for SlateDbStorage {
     }
 
     async fn close(&self) -> StorageResult<()> {
-        // Stop the durable bridge first so no status subscriber outlives close.
-        self.durable_bridge_abort.abort();
         self.db.close().await.map_err(StorageError::from_storage)?;
-        // Close the cache after SlateDB so no inserts race the flushers. Log and
-        // swallow errors: cache flush failures only cost cache warmth.
-        // TODO(slatedb 0.13): remove once DbCache owns its close lifecycle.
-        if let Some(cache) = &self.managed_cache
-            && let Err(e) = cache.close().await
-        {
-            warn!(error = ?e, "foyer hybrid cache close failed");
-        }
         Ok(())
     }
 }
@@ -276,7 +228,7 @@ pub(crate) struct SlateDbIterator {
 }
 
 #[async_trait]
-impl TsIterator for SlateDbIterator {
+impl StorageIterator for SlateDbIterator {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn next(&mut self) -> StorageResult<Option<Record>> {
         match self.iter.next().await.map_err(StorageError::from_storage)? {
@@ -287,7 +239,7 @@ impl TsIterator for SlateDbIterator {
 }
 
 /// SlateDB snapshot wrapper providing a consistent read-only view.
-pub struct SlateDbStorageSnapshot {
+pub(crate) struct SlateDbStorageSnapshot {
     snapshot: Arc<DbSnapshot>,
 }
 
@@ -310,7 +262,7 @@ impl TsRead for SlateDbStorageSnapshot {
     async fn scan_iter(
         &self,
         range: BytesRange,
-    ) -> StorageResult<Box<dyn TsIterator + Send + 'static>> {
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let iter = self
             .snapshot
             .scan_with_options(range, &default_scan_options())
@@ -326,28 +278,14 @@ impl TsSnapshot for SlateDbStorageSnapshot {}
 ///
 /// Provides read-only access without fencing, so multiple readers can coexist
 /// with a single writer.
-pub struct SlateDbStorageReader {
+pub(crate) struct SlateDbStorageReader {
     reader: Arc<DbReader>,
-    // TODO(slatedb 0.13): remove once DbCache exposes a close() hook.
-    managed_cache: Option<OwnedHybridCache>,
 }
 
 impl SlateDbStorageReader {
     /// Creates a new reader wrapping the given `DbReader`.
-    pub fn new(reader: Arc<DbReader>) -> Self {
-        Self::new_with_managed_cache(reader, None)
-    }
-
-    /// Creates a reader that will explicitly close the given foyer hybrid cache
-    /// during [`TsRead::close`].
-    pub(crate) fn new_with_managed_cache(
-        reader: Arc<DbReader>,
-        managed_cache: Option<OwnedHybridCache>,
-    ) -> Self {
-        Self {
-            reader,
-            managed_cache,
-        }
+    pub(crate) fn new(reader: Arc<DbReader>) -> Self {
+        Self { reader }
     }
 }
 
@@ -370,7 +308,7 @@ impl TsRead for SlateDbStorageReader {
     async fn scan_iter(
         &self,
         range: BytesRange,
-    ) -> StorageResult<Box<dyn TsIterator + Send + 'static>> {
+    ) -> StorageResult<Box<dyn StorageIterator + Send + 'static>> {
         let iter = self
             .reader
             .scan_with_options(range, &default_scan_options())
@@ -384,50 +322,18 @@ impl TsRead for SlateDbStorageReader {
             .close()
             .await
             .map_err(StorageError::from_storage)?;
-        // TODO(slatedb 0.13): remove once DbCache owns its close lifecycle.
-        if let Some(cache) = &self.managed_cache
-            && let Err(e) = cache.close().await
-        {
-            warn!(error = ?e, "foyer hybrid cache close failed");
-        }
         Ok(())
-    }
-}
-
-impl From<Ttl> for slatedb::config::Ttl {
-    fn from(value: Ttl) -> Self {
-        match value {
-            Ttl::Default => slatedb::config::Ttl::Default,
-            Ttl::NoExpiry => slatedb::config::Ttl::NoExpiry,
-            Ttl::ExpireAfter(ts) => slatedb::config::Ttl::ExpireAfter(ts),
-            Ttl::ExpireAt(ts) => slatedb::config::Ttl::ExpireAt(ts),
-        }
-    }
-}
-
-impl From<PutOptions> for slatedb::config::PutOptions {
-    fn from(value: PutOptions) -> Self {
-        Self {
-            ttl: value.ttl.into(),
-        }
-    }
-}
-
-impl From<MergeOptions> for slatedb::config::MergeOptions {
-    fn from(value: MergeOptions) -> Self {
-        Self {
-            ttl: value.ttl.into(),
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::storage::{MergeOptions, PutOptions, Ttl};
+    use slatedb::DbBuilder;
     use slatedb::config::Settings;
     use slatedb::object_store::memory::InMemory;
     use slatedb::{MergeOperator as SlateDbMergeOperator, MergeOperatorError};
-    use slatedb::{DbBuilder};
     use slatedb_common::clock::MockSystemClock;
 
     #[tokio::test]
@@ -558,7 +464,7 @@ mod tests {
     }
 
     /// Simple merge operator that concatenates existing and new values.
-    /// Implements SlateDB's `MergeOperator` directly (no adapter).
+    /// Implements SlateDB's `MergeOperator` directly (test-only).
     struct ConcatMergeOperator;
 
     impl SlateDbMergeOperator for ConcatMergeOperator {
@@ -642,20 +548,7 @@ mod tests {
     }
 
     async fn reader_can_see(path: &str, object_store: Arc<InMemory>, key: &str) -> bool {
-        reader_can_see_with_merge_op(path, object_store, key, None).await
-    }
-
-    async fn reader_can_see_with_merge_op(
-        path: &str,
-        object_store: Arc<InMemory>,
-        key: &str,
-        merge_op: Option<Arc<dyn SlateDbMergeOperator + Send + Sync>>,
-    ) -> bool {
-        let mut builder = DbReader::builder(path, object_store);
-        if let Some(op) = merge_op {
-            builder = builder.with_merge_operator(op);
-        }
-        let reader = builder.build().await.unwrap();
+        let reader = DbReader::builder(path, object_store).build().await.unwrap();
         let storage_reader = SlateDbStorageReader::new(Arc::new(reader));
         storage_reader
             .get(Bytes::from(key.to_owned()))
@@ -713,38 +606,6 @@ mod tests {
             .unwrap();
 
         assert!(reader_can_see(path, object_store.clone(), "k1").await);
-        storage.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn merge_with_await_durable_true_is_visible_to_reader() {
-        let object_store = Arc::new(InMemory::new());
-        let path = "/test/merge_durable";
-
-        let db = DbBuilder::new(path, object_store.clone())
-            .with_merge_operator(Arc::new(ConcatMergeOperator))
-            .build()
-            .await
-            .unwrap();
-        let storage = SlateDbStorage::new(Arc::new(db));
-
-        storage
-            .merge_with_options(
-                vec![Record::new(Bytes::from("k1"), Bytes::from("v1")).into()],
-                WriteOptions {
-                    await_durable: true,
-                },
-            )
-            .await
-            .unwrap();
-
-        let reader_merge_op: Arc<dyn SlateDbMergeOperator + Send + Sync> =
-            Arc::new(ConcatMergeOperator);
-        assert!(
-            reader_can_see_with_merge_op(path, object_store.clone(), "k1", Some(reader_merge_op))
-                .await
-        );
-
         storage.close().await.unwrap();
     }
 

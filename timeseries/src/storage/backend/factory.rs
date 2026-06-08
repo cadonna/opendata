@@ -1,55 +1,36 @@
 //! Factory functions that build native SlateDB storage from configuration.
 //!
-//! Replaces the previous `common::storage::factory` (`StorageBuilder`,
-//! `create_storage_read`, `StorageReaderRuntime`, `StorageSemantics`) with two
-//! focused constructors — [`build_storage`] for the read/write `Db` and
-//! [`build_reader`] for the read-only `DbReader`.
+//! Replaces the previous use of `common::storage`'s `StorageBuilder` /
+//! `create_storage_read` (which yield the `Arc<dyn Storage>` handles timeseries
+//! no longer uses) with two focused constructors — [`build_storage`] for the
+//! read/write `Db` and [`build_reader`] for the read-only `DbReader`.
+//!
+//! The reusable SlateDB-specific plumbing — object-store creation, the foyer
+//! block-cache builder, the metrics recorder, and the merge-operator adapter —
+//! is reused from `common::storage`, not duplicated.
 
 use std::sync::Arc;
 
+use common::storage::config::{SlateDbStorageConfig, StorageConfig};
+use common::storage::factory::{build_split_cache, create_object_store};
+use common::storage::metrics_recorder::MetricsRsRecorder;
+use common::storage::slate::SlateDbStorage as CommonSlateDbStorage;
+use common::storage::{MergeOperator, StorageError, StorageResult};
 use slatedb::config::Settings;
-use slatedb::db_cache::DbCache;
-use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
-pub use slatedb::db_cache::{CachedEntry, CachedKey};
-use slatedb::object_store::{self, ObjectStore};
-use slatedb::{DbBuilder, DbReader, MergeOperator as SlateDbMergeOperator};
+use slatedb::{DbBuilder, DbReader};
 use tracing::info;
 use uuid::Uuid;
 
-use super::config::{
-    BlockCacheConfig, FoyerWritePolicy, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig,
-};
-use super::metrics::{MetricsRsRecorder, MixtricsBridge};
-use super::ops::{StorageError, StorageResult};
 use super::slate::{SlateDbStorage, SlateDbStorageReader};
-
-/// A merge operator handed to SlateDB. Timeseries implements
-/// `slatedb::MergeOperator` directly (see `storage::merge_operator`).
-pub type SlateMergeOperator = Arc<dyn SlateDbMergeOperator + Send + Sync>;
-
-/// Handle to a foyer hybrid cache we own and must close explicitly on shutdown.
-///
-/// TODO(slatedb 0.13): remove this once SlateDB's `DbCache` trait gains a
-/// `close()` hook and `Db::close()` / `DbReader::close()` drive cache shutdown,
-/// so callers won't need a side handle to close the hybrid cache.
-pub(crate) type OwnedHybridCache = foyer::HybridCache<CachedKey, CachedEntry>;
-
-/// Block cache we constructed internally — we keep the `HybridCache` handle so
-/// we can `close().await` it from `TsRead::close()` rather than relying on
-/// foyer's Drop-based close, which races runtime shutdown.
-struct ManagedBlockCache {
-    db_cache: Arc<dyn DbCache>,
-    hybrid: OwnedHybridCache,
-}
 
 /// Builds a read/write [`SlateDbStorage`] from configuration.
 ///
 /// Registers the metrics recorder and, when provided, the merge operator. The
-/// `InMemory` config variant is not supported (see module docs); callers should
-/// use SlateDb over an in-memory object store for tests.
-pub async fn build_storage(
+/// `InMemory` config variant is not supported (Design B uses SlateDb over an
+/// in-memory object store for tests).
+pub(crate) async fn build_storage(
     config: &StorageConfig,
-    merge_operator: Option<SlateMergeOperator>,
+    merge_operator: Option<Arc<dyn MergeOperator>>,
 ) -> StorageResult<SlateDbStorage> {
     let slate_config = require_slatedb(config)?;
     let object_store = create_object_store(&slate_config.object_store)?;
@@ -63,23 +44,21 @@ pub async fn build_storage(
         .with_settings(settings)
         .with_metrics_recorder(Arc::new(MetricsRsRecorder));
 
-    let mut managed_cache: Option<OwnedHybridCache> = None;
-    if let Some(managed) = create_block_cache_from_config(&slate_config.block_cache).await? {
-        db_builder = db_builder.with_db_cache(managed.db_cache);
-        managed_cache = Some(managed.hybrid);
+    if let Some(cache) =
+        build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?
+    {
+        db_builder = db_builder.with_db_cache(cache);
     }
     if let Some(op) = merge_operator {
-        db_builder = db_builder.with_merge_operator(op);
+        let adapter = CommonSlateDbStorage::merge_operator_adapter(op);
+        db_builder = db_builder.with_merge_operator(Arc::new(adapter));
     }
 
     let db = db_builder
         .build()
         .await
         .map_err(|e| StorageError::Storage(format!("Failed to create SlateDB: {}", e)))?;
-    Ok(SlateDbStorage::new_with_managed_cache(
-        Arc::new(db),
-        managed_cache,
-    ))
+    Ok(SlateDbStorage::new(Arc::new(db)))
 }
 
 /// Builds a read-only [`SlateDbStorageReader`] from configuration.
@@ -87,11 +66,11 @@ pub async fn build_storage(
 /// Uses `DbReader`, which does not participate in fencing, so it can coexist
 /// with a live writer. When `checkpoint_id` is set, the reader is pinned to that
 /// checkpoint and does not advance with newer writes.
-pub async fn build_reader(
+pub(crate) async fn build_reader(
     config: &StorageConfig,
     reader_options: slatedb::config::DbReaderOptions,
     checkpoint_id: Option<Uuid>,
-    merge_operator: Option<SlateMergeOperator>,
+    merge_operator: Option<Arc<dyn MergeOperator>>,
 ) -> StorageResult<SlateDbStorageReader> {
     let slate_config = require_slatedb(config)?;
     let object_store = create_object_store(&slate_config.object_store)?;
@@ -103,23 +82,21 @@ pub async fn build_reader(
         builder = builder.with_checkpoint_id(checkpoint_id);
     }
     if let Some(op) = merge_operator {
-        builder = builder.with_merge_operator(op);
+        let adapter = CommonSlateDbStorage::merge_operator_adapter(op);
+        builder = builder.with_merge_operator(Arc::new(adapter));
     }
 
-    let mut managed_cache: Option<OwnedHybridCache> = None;
-    if let Some(managed) = create_block_cache_from_config(&slate_config.block_cache).await? {
-        builder = builder.with_db_cache(managed.db_cache);
-        managed_cache = Some(managed.hybrid);
+    if let Some(cache) =
+        build_split_cache(&slate_config.block_cache, &slate_config.meta_cache).await?
+    {
+        builder = builder.with_db_cache(cache);
     }
 
     let reader = builder
         .build()
         .await
         .map_err(|e| StorageError::Storage(format!("Failed to create SlateDB reader: {}", e)))?;
-    Ok(SlateDbStorageReader::new_with_managed_cache(
-        Arc::new(reader),
-        managed_cache,
-    ))
+    Ok(SlateDbStorageReader::new(Arc::new(reader)))
 }
 
 fn require_slatedb(config: &StorageConfig) -> StorageResult<&SlateDbStorageConfig> {
@@ -142,149 +119,13 @@ fn load_settings(slate_config: &SlateDbStorageConfig) -> StorageResult<Settings>
     }
 }
 
-/// Creates an object store from configuration without initializing SlateDB.
-pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn ObjectStore>> {
-    match config {
-        ObjectStoreConfig::InMemory => Ok(Arc::new(object_store::memory::InMemory::new())),
-        ObjectStoreConfig::Aws(aws_config) => {
-            let store = object_store::aws::AmazonS3Builder::from_env()
-                .with_region(&aws_config.region)
-                .with_bucket_name(&aws_config.bucket)
-                .build()
-                .map_err(|e| {
-                    StorageError::Storage(format!("Failed to create AWS S3 store: {}", e))
-                })?;
-            Ok(Arc::new(store))
-        }
-        ObjectStoreConfig::Local(local_config) => {
-            std::fs::create_dir_all(&local_config.path).map_err(|e| {
-                StorageError::Storage(format!(
-                    "Failed to create storage directory '{}': {}",
-                    local_config.path, e
-                ))
-            })?;
-            let store = object_store::local::LocalFileSystem::new_with_prefix(&local_config.path)
-                .map_err(|e| {
-                    StorageError::Storage(format!(
-                        "Failed to create local filesystem store: {}",
-                        e
-                    ))
-                })?;
-            Ok(Arc::new(store))
-        }
-    }
-}
-
-/// Creates a block cache from the serializable config, if present. Returns both
-/// the `DbCache` trait object handed to SlateDB and a `HybridCache` handle the
-/// caller keeps so it can close the cache deterministically on shutdown.
-async fn create_block_cache_from_config(
-    config: &Option<BlockCacheConfig>,
-) -> StorageResult<Option<ManagedBlockCache>> {
-    let Some(config) = config else {
-        return Ok(None);
-    };
-    match config {
-        BlockCacheConfig::FoyerHybrid(foyer_config) => {
-            use foyer::{
-                BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder,
-                HybridCachePolicy, PsyncIoEngineConfig,
-            };
-
-            let memory_capacity = usize::try_from(foyer_config.memory_capacity).map_err(|_| {
-                StorageError::Storage(format!(
-                    "memory_capacity {} exceeds usize::MAX on this platform",
-                    foyer_config.memory_capacity
-                ))
-            })?;
-            let disk_capacity = usize::try_from(foyer_config.disk_capacity).map_err(|_| {
-                StorageError::Storage(format!(
-                    "disk_capacity {} exceeds usize::MAX on this platform",
-                    foyer_config.disk_capacity
-                ))
-            })?;
-            let buffer_pool_size = usize::try_from(foyer_config.effective_buffer_pool_size())
-                .map_err(|_| {
-                    StorageError::Storage(format!(
-                        "buffer_pool_size {} exceeds usize::MAX on this platform",
-                        foyer_config.effective_buffer_pool_size()
-                    ))
-                })?;
-            let submit_queue_size_threshold =
-                usize::try_from(foyer_config.submit_queue_size_threshold).map_err(|_| {
-                    StorageError::Storage(format!(
-                        "submit_queue_size_threshold {} exceeds usize::MAX on this platform",
-                        foyer_config.submit_queue_size_threshold
-                    ))
-                })?;
-
-            let policy = match foyer_config.write_policy {
-                FoyerWritePolicy::WriteOnInsertion => HybridCachePolicy::WriteOnInsertion,
-                FoyerWritePolicy::WriteOnEviction => HybridCachePolicy::WriteOnEviction,
-            };
-
-            let device = {
-                #[cfg(target_os = "linux")]
-                let builder = FsDeviceBuilder::new(&foyer_config.disk_path)
-                    .with_capacity(disk_capacity)
-                    .with_direct(true);
-                #[cfg(not(target_os = "linux"))]
-                let builder =
-                    FsDeviceBuilder::new(&foyer_config.disk_path).with_capacity(disk_capacity);
-                builder.build().map_err(|e| {
-                    StorageError::Storage(format!("Failed to build foyer device: {}", e))
-                })?
-            };
-
-            let cache = HybridCacheBuilder::new()
-                .with_name("slatedb_block_cache")
-                .with_metrics_registry(Box::new(MixtricsBridge))
-                .with_policy(policy)
-                .memory(memory_capacity)
-                .with_weighter(|_, v: &CachedEntry| v.size())
-                .storage()
-                .with_io_engine_config(PsyncIoEngineConfig::new())
-                .with_engine_config(
-                    BlockEngineConfig::new(device)
-                        .with_flushers(foyer_config.flushers)
-                        .with_buffer_pool_size(buffer_pool_size)
-                        .with_submit_queue_size_threshold(submit_queue_size_threshold),
-                )
-                .build()
-                .await
-                .map_err(|e| {
-                    StorageError::Storage(format!("Failed to create hybrid cache: {}", e))
-                })?;
-
-            info!(
-                memory_mb = foyer_config.memory_capacity / (1024 * 1024),
-                disk_mb = foyer_config.disk_capacity / (1024 * 1024),
-                disk_path = %foyer_config.disk_path,
-                write_policy = ?foyer_config.write_policy,
-                flushers = foyer_config.flushers,
-                buffer_pool_mb = foyer_config.effective_buffer_pool_size() / (1024 * 1024),
-                submit_queue_threshold_mb =
-                    foyer_config.submit_queue_size_threshold / (1024 * 1024),
-                "hybrid block cache enabled"
-            );
-
-            let db_cache =
-                Arc::new(FoyerHybridCache::new_with_cache(cache.clone())) as Arc<dyn DbCache>;
-            Ok(Some(ManagedBlockCache {
-                db_cache,
-                hybrid: cache,
-            }))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::backend::config::{
-        FoyerHybridCacheConfig, LocalObjectStoreConfig, SlateDbStorageConfig,
-    };
     use crate::storage::backend::traits::TsRead;
+    use common::storage::config::{
+        BlockCacheConfig, FoyerHybridCacheConfig, LocalObjectStoreConfig, ObjectStoreConfig,
+    };
 
     fn foyer_cache_config(
         memory_capacity: u64,
@@ -310,6 +151,7 @@ mod tests {
             }),
             settings_path: None,
             block_cache: None,
+            meta_cache: None,
         })
     }
 
@@ -336,6 +178,7 @@ mod tests {
                 4 * 1024 * 1024,
                 cache_dir.to_str().unwrap().to_string(),
             ))),
+            meta_cache: None,
         });
 
         let storage = build_storage(&config, None).await;
@@ -365,6 +208,7 @@ mod tests {
                 4 * 1024 * 1024,
                 cache_dir.to_str().unwrap().to_string(),
             ))),
+            meta_cache: None,
         };
 
         // Open a writer first so the reader has a manifest to read, then drop it
@@ -388,16 +232,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_return_none_when_no_block_cache_configured() {
-        let result = create_block_cache_from_config(&None).await.unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
     async fn should_work_without_block_cache() {
         let tmp = tempfile::tempdir().unwrap();
         let config = slatedb_config_with_local_dir(tmp.path());
         let storage = build_storage(&config, None).await;
         assert!(storage.is_ok());
+        storage.unwrap().close().await.unwrap();
     }
 }
