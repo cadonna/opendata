@@ -240,4 +240,53 @@ mod tests {
         assert!(storage.is_ok());
         storage.unwrap().close().await.unwrap();
     }
+
+    /// A SlateDb config whose block-cache `disk_path` is a regular file (not a
+    /// directory), which foyer deterministically rejects.
+    fn config_with_invalid_block_cache_disk_path(
+        obj_dir: &std::path::Path,
+        bad_disk_path: &str,
+    ) -> SlateDbStorageConfig {
+        SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: obj_dir.to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: Some(BlockCacheConfig::FoyerHybrid(foyer_cache_config(
+                1024 * 1024,
+                4 * 1024 * 1024,
+                bad_disk_path.to_string(),
+            ))),
+            meta_cache: None,
+        }
+    }
+
+    // Confirms `build_storage` surfaces a block-cache build failure rather than
+    // silently succeeding. foyer panics (an unwrap inside the device builder)
+    // on an invalid disk_path rather than returning an error, so the failing
+    // call is isolated to a spawned task to keep the panic from aborting the
+    // test. This exercises timeseries' factory wiring; the cache builder itself
+    // is unit-tested in `common::storage::factory`.
+    #[tokio::test]
+    async fn should_fail_when_config_cache_disk_path_is_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Use a regular file as disk_path — foyer expects a directory.
+        let bad_path = tmp.path().join("not-a-dir");
+        std::fs::write(&bad_path, b"").unwrap();
+
+        let config = config_with_invalid_block_cache_disk_path(
+            &tmp.path().join("obj"),
+            bad_path.to_str().unwrap(),
+        );
+
+        let handle = tokio::spawn(async move {
+            let _ = build_storage(&config, None).await;
+        });
+        let result = handle.await;
+        assert!(
+            result.is_err() && result.unwrap_err().is_panic(),
+            "expected foyer to panic on invalid disk_path"
+        );
+    }
 }
