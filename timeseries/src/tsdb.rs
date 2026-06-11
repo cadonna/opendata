@@ -20,8 +20,7 @@ use crate::model::{
     TimeBucket,
 };
 use crate::query::{BucketQueryReader, QueryReader};
-use crate::storage::OpenTsdbStorageReadExt;
-use crate::storage::backend::{SlateDbStorage, TsRead, TsSnapshot};
+use crate::storage::{Storage, StorageRead, StorageSnapshot};
 use crate::tsdb_metrics;
 use crate::util::Result;
 
@@ -969,7 +968,7 @@ pub(crate) async fn discover_label_values<R: QueryReader>(
 /// Tsdb manages multiple MiniTsdb instances (one per time bucket) and provides
 /// a unified QueryReader interface that merges results across buckets.
 pub(crate) struct Tsdb {
-    storage: Arc<SlateDbStorage>,
+    storage: Arc<Storage>,
 
     /// TTI cache (15 min idle) for buckets being actively ingested into.
     /// Also used during queries so that unflushed data is visible.
@@ -989,14 +988,11 @@ pub(crate) struct Tsdb {
 }
 
 impl Tsdb {
-    pub(crate) fn new(storage: Arc<SlateDbStorage>) -> Self {
+    pub(crate) fn new(storage: Arc<Storage>) -> Self {
         Self::with_retention(storage, None)
     }
 
-    pub(crate) fn with_retention(
-        storage: Arc<SlateDbStorage>,
-        retention: Option<Duration>,
-    ) -> Self {
+    pub(crate) fn with_retention(storage: Arc<Storage>, retention: Option<Duration>) -> Self {
         // TTI cache: 15 minute idle timeout for ingest buckets
         let ingest_cache = Cache::builder()
             .time_to_idle(Duration::from_secs(15 * 60))
@@ -1015,8 +1011,8 @@ impl Tsdb {
 
     /// Returns a read handle to the underlying storage, for background tasks
     /// like the cache warmer.
-    pub(crate) fn storage_read(&self) -> Arc<dyn TsRead> {
-        self.storage.clone() as Arc<dyn TsRead>
+    pub(crate) fn storage_read(&self) -> Storage {
+        (*self.storage).clone()
     }
 
     /// Get or create a MiniTsdb for ingestion into a specific bucket.
@@ -1087,15 +1083,15 @@ impl Tsdb {
     /// available, otherwise constructs a reader directly from the snapshot.
     async fn build_readers(
         &self,
-        snapshot: &Arc<dyn TsSnapshot>,
+        snapshot: &StorageSnapshot,
         buckets: Vec<TimeBucket>,
-    ) -> Vec<(TimeBucket, MiniQueryReader)> {
+    ) -> Vec<(TimeBucket, MiniQueryReader<StorageSnapshot>)> {
         let mut readers = Vec::with_capacity(buckets.len());
         for bucket in buckets {
             let reader = if let Some(mini) = self.ingest_cache.get(&bucket).await {
                 mini.query_reader()
             } else {
-                MiniQueryReader::new(bucket, snapshot.clone() as Arc<dyn TsRead>)
+                MiniQueryReader::new(bucket, snapshot.clone())
             };
             readers.push((bucket, reader));
         }
@@ -1302,15 +1298,6 @@ impl TsdbEngine {
     /// Returns `true` when the engine is read-only.
     pub(crate) fn is_read_only(&self) -> bool {
         matches!(self, Self::ReadOnly(_))
-    }
-
-    /// Returns a read handle to the underlying storage, for background tasks
-    /// like the cache warmer.
-    pub(crate) fn storage_read(&self) -> Arc<dyn TsRead> {
-        match self {
-            Self::ReadWrite(tsdb) => tsdb.storage_read(),
-            Self::ReadOnly(reader) => reader.storage_read(),
-        }
     }
 
     /// Returns a clone of the inner `Arc<Tsdb>` if this is a read-write engine.
@@ -1556,11 +1543,11 @@ impl From<Arc<crate::reader::TimeSeriesDbReader>> for TsdbEngine {
 /// QueryReader implementation that properly handles bucket-scoped series IDs.
 pub(crate) struct TsdbQueryReader {
     /// Map from bucket to MiniTsdb for efficient bucket queries
-    mini_readers: HashMap<TimeBucket, MiniQueryReader>,
+    mini_readers: HashMap<TimeBucket, MiniQueryReader<StorageSnapshot>>,
 }
 
 impl TsdbQueryReader {
-    pub fn new(mini_tsdbs: Vec<(TimeBucket, MiniQueryReader)>) -> Self {
+    pub fn new(mini_tsdbs: Vec<(TimeBucket, MiniQueryReader<StorageSnapshot>)>) -> Self {
         let bucket_minis = mini_tsdbs.into_iter().collect();
         Self {
             mini_readers: bucket_minis,
@@ -1655,7 +1642,7 @@ impl QueryReader for TsdbQueryReader {
 mod tests {
     use super::*;
     use crate::model::MetricType;
-    use crate::storage::backend::in_memory_storage;
+    use crate::storage::in_memory_storage;
 
     fn create_sample(
         metric_name: &str,
@@ -3365,8 +3352,8 @@ mod tests {
         /// counter spanning 3 samples, flush, and return both handles.
         async fn create_writer_and_reader_with_counter() -> (Tsdb, crate::reader::TimeSeriesDbReader)
         {
-            let storage = Arc::new(in_memory_storage().await);
-            let tsdb = Tsdb::new(storage.clone());
+            let shared = crate::storage::in_memory_shared_storage().await;
+            let tsdb = Tsdb::new(shared.storage.clone());
             let series = vec![
                 create_sample("req_total", vec![("env", "prod")], 4_000_000, 10.0),
                 create_sample("req_total", vec![("env", "prod")], 4_010_000, 20.0),
@@ -3374,7 +3361,8 @@ mod tests {
             ];
             tsdb.ingest_samples(series, None).await.unwrap();
             tsdb.flush().await.unwrap();
-            let reader = crate::reader::TimeSeriesDbReader::from_storage(storage);
+            // Open the reader only after the flush so its view includes the data.
+            let reader = crate::reader::TimeSeriesDbReader::from_storage(shared.reader().await);
             (tsdb, reader)
         }
 

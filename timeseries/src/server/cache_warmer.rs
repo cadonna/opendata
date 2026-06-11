@@ -1,14 +1,14 @@
 //! Startup cache warmer that pre-populates the block cache by scanning
-//! recent time bucket key ranges through the normal StorageRead API.
+//! recent time bucket key ranges through the normal storage read API.
 //!
 //! This is a temporary workaround until SlateDB's CacheManager
 //! (`set_warm_prefixes()` + `warm_current()`) is available. Delete this
 //! module when that lands.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::BytesRange;
+use common::storage::StorageError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -17,8 +17,7 @@ use crate::serde::TimeBucketScoped;
 use crate::serde::key::{
     BucketListKey, ForwardIndexKey, InvertedIndexKey, SeriesDictionaryKey, TimeSeriesKey,
 };
-use crate::storage::OpenTsdbStorageReadExt;
-use crate::storage::backend::TsRead;
+use crate::storage::StorageRead;
 
 const LOG_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -38,7 +37,10 @@ impl CacheWarmerHandle {
 
 /// Spawns a one-off cache warming task. Returns a handle that must be
 /// shut down before closing the database.
-pub(crate) fn start(storage: Arc<dyn TsRead>, config: CacheWarmerConfig) -> CacheWarmerHandle {
+pub(crate) fn start<R: StorageRead + 'static>(
+    storage: R,
+    config: CacheWarmerConfig,
+) -> CacheWarmerHandle {
     let cancel = CancellationToken::new();
     let join = tokio::spawn({
         let cancel = cancel.clone();
@@ -63,8 +65,8 @@ struct WarmStats {
     elapsed: Duration,
 }
 
-async fn warm(
-    storage: &Arc<dyn TsRead>,
+async fn warm<R: StorageRead>(
+    storage: &R,
     config: &CacheWarmerConfig,
     cancel: &CancellationToken,
 ) -> crate::util::Result<WarmStats> {
@@ -121,10 +123,15 @@ async fn warm(
 
 /// Scan a key range, consuming all records to populate the block cache.
 /// Returns the number of records touched.
-async fn drain_scan(storage: &Arc<dyn TsRead>, range: BytesRange) -> crate::util::Result<u64> {
-    let mut iter = storage.scan_iter(range).await?;
+async fn drain_scan<R: StorageRead>(storage: &R, range: BytesRange) -> crate::util::Result<u64> {
+    let mut iter = storage.scan(range).await?;
     let mut count = 0u64;
-    while iter.next().await?.is_some() {
+    while iter
+        .next()
+        .await
+        .map_err(StorageError::from_storage)?
+        .is_some()
+    {
         count += 1;
     }
     Ok(count)
@@ -134,10 +141,11 @@ async fn drain_scan(storage: &Arc<dyn TsRead>, range: BytesRange) -> crate::util
 mod tests {
     use super::*;
     use crate::model::Series;
-    use crate::storage::backend::{SlateDbStorage, in_memory_storage};
+    use crate::storage::{Storage, in_memory_storage};
     use crate::tsdb::Tsdb;
+    use std::sync::Arc;
 
-    async fn create_storage() -> Arc<SlateDbStorage> {
+    async fn create_storage() -> Arc<Storage> {
         Arc::new(in_memory_storage().await)
     }
 
@@ -168,9 +176,7 @@ mod tests {
 
         // when
         let cancel = CancellationToken::new();
-        let stats = warm(&(storage as Arc<dyn TsRead>), &config, &cancel)
-            .await
-            .unwrap();
+        let stats = warm(storage.as_ref(), &config, &cancel).await.unwrap();
 
         // then
         assert!(stats.buckets > 0);
@@ -188,9 +194,7 @@ mod tests {
 
         // when
         let cancel = CancellationToken::new();
-        let stats = warm(&(storage as Arc<dyn TsRead>), &config, &cancel)
-            .await
-            .unwrap();
+        let stats = warm(storage.as_ref(), &config, &cancel).await.unwrap();
 
         // then
         assert_eq!(stats.buckets, 0);
@@ -225,9 +229,7 @@ mod tests {
         // when — cancel before starting
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let stats = warm(&(storage as Arc<dyn TsRead>), &config, &cancel)
-            .await
-            .unwrap();
+        let stats = warm(storage.as_ref(), &config, &cancel).await.unwrap();
 
         // then — should have found buckets but processed none
         assert_eq!(stats.records, 0);
