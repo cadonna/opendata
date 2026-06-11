@@ -241,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn should_create_scraper() {
         // given
-        let storage = Arc::new(crate::storage::backend::in_memory_storage().await);
+        let storage = Arc::new(crate::storage::in_memory_storage().await);
         let tsdb = Arc::new(Tsdb::new(storage));
         let config = PrometheusConfig::default();
 

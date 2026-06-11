@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::storage::backend::in_memory_storage;
+use crate::storage::in_memory_storage;
 
 use crate::model::{
     InstantSample, Label, Labels, MetricType, QueryOptions, RangeSample, Sample, Series,

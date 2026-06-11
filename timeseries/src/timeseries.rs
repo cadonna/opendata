@@ -11,9 +11,7 @@ use std::time::{Duration, SystemTime};
 use crate::config::Config;
 use crate::error::{QueryError, Result};
 use crate::model::{Labels, MetricMetadata, QueryValue, RangeSample, Series};
-use crate::storage::backend::build_storage;
-use crate::storage::coalesce_bucket_list;
-use crate::storage::merge_operator::OpenTsdbMergeOperator;
+use crate::storage::Storage;
 use crate::tsdb::{
     Tsdb, TsdbReadEngine, find_label_values_in_range, find_labels_in_range, find_series_in_range,
 };
@@ -76,13 +74,7 @@ impl TimeSeriesDb {
     /// # }
     /// ```
     pub async fn open(config: Config) -> Result<Self> {
-        let storage = Arc::new(
-            build_storage(&config.storage, Some(Arc::new(OpenTsdbMergeOperator))).await?,
-        );
-        // Flatten accumulated BucketList merge operands into a single Put so
-        // later reads don't have to replay them across SSTs. Runs before any
-        // writer is started, so no concurrent merges can race the Put.
-        coalesce_bucket_list(storage.as_ref()).await?;
+        let storage = Arc::new(Storage::try_new(&config.storage).await?);
         let tsdb = Tsdb::with_retention(storage, config.retention);
         Ok(Self { tsdb })
     }

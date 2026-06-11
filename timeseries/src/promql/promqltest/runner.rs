@@ -2,7 +2,7 @@ use crate::promql::promqltest::assert::assert_results;
 use crate::promql::promqltest::dsl::*;
 use crate::promql::promqltest::evaluator::eval_instant;
 use crate::promql::promqltest::loader::load_series;
-use crate::storage::backend::in_memory_storage;
+use crate::storage::in_memory_storage;
 use crate::tsdb::Tsdb;
 use std::collections::HashMap;
 use std::fs;
