@@ -340,6 +340,7 @@ mod integration_tests {
     use crate::log::{LogDb, LogDbBuilder};
     use crate::model::Record;
     use crate::reader::LogRead;
+    use crate::segment_extractor::LogSegmentExtractor;
 
     const EXPECTED_EXTRACTOR_NAME: &str = "opendata-log/v1";
     const LOG_SUBSYSTEM: u8 = 0x03;
@@ -371,6 +372,7 @@ mod integration_tests {
     async fn manifest_segment_ids(slate: &SlateDbStorageConfig) -> Vec<u32> {
         let object_store = create_object_store(&slate.object_store).expect("object store");
         let reader = DbReader::builder(slate.path.clone(), object_store)
+            .with_segment_extractor(LogSegmentExtractor::shared())
             .build()
             .await
             .expect("open DbReader");
@@ -419,6 +421,7 @@ mod integration_tests {
         // then — reopen as a DbReader and verify the extractor name is persisted
         let object_store = create_object_store(&slate.object_store).expect("object store");
         let reader = DbReader::builder(slate.path.clone(), object_store)
+            .with_segment_extractor(LogSegmentExtractor::shared())
             .build()
             .await
             .expect("open DbReader");

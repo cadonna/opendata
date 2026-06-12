@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use slatedb::object_store::ObjectStore;
 use slatedb::object_store::path::Path;
+use slatedb::object_store::{ObjectStore, ObjectStoreExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ConsumerConfig;
@@ -411,8 +411,8 @@ mod tests {
     use crate::queue::{Metadata, QueueProducer};
     use bytes::Bytes;
     use common::ObjectStoreConfig;
-    use slatedb::object_store::PutPayload;
     use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::{ObjectStoreExt, PutPayload};
     use std::time::Duration;
 
     const TEST_MANIFEST_PATH: &str = "test/manifest";

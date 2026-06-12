@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::{BufMut, Bytes, BytesMut};
 use slatedb::object_store::path::Path;
 use slatedb::object_store::{
-    Error as ObjectStoreError, ObjectStore, PutMode, PutPayload, UpdateVersion,
+    Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
 };
 
 use crate::error::{Error, Result};
@@ -884,6 +884,7 @@ pub fn parse_manifest(data: Bytes) -> Result<ManifestView> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slatedb::object_store::ObjectStoreExt;
     use slatedb::object_store::memory::InMemory;
 
     const TEST_MANIFEST_PATH: &str = "test/manifest";
