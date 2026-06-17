@@ -247,7 +247,7 @@ impl StorageRead for SlateDbStorage {
         let options = default_scan_options().with_filter_context(filter_context);
         let iter = self
             .db
-            .scan_prefix_with_options(prefix, &options)
+            .scan_prefix_with_options(prefix, .., &options)
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
@@ -331,7 +331,7 @@ impl StorageRead for SlateDbStorageSnapshot {
         let options = default_scan_options().with_filter_context(filter_context);
         let iter = self
             .snapshot
-            .scan_prefix_with_options(prefix, &options)
+            .scan_prefix_with_options(prefix, .., &options)
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
@@ -554,7 +554,7 @@ impl StorageRead for SlateDbStorageReader {
         let options = default_scan_options().with_filter_context(filter_context);
         let iter = self
             .reader
-            .scan_prefix_with_options(prefix, &options)
+            .scan_prefix_with_options(prefix, .., &options)
             .await
             .map_err(StorageError::from_storage)?;
         Ok(Box::new(SlateDbIterator { iter }))
