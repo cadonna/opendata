@@ -17,7 +17,7 @@ pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 pub use slatedb::db_cache::{CachedEntry, CachedKey, SplitCache};
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
-use slatedb::{DbReader, FilterPolicy, SstReader};
+use slatedb::{DbReader, FilterPolicy, PrefixExtractor, SstReader};
 use tracing::info;
 use uuid::Uuid;
 
@@ -250,6 +250,7 @@ impl StorageReaderRuntime {
 pub struct StorageSemantics {
     pub(crate) merge_operator: Option<Arc<dyn MergeOperator>>,
     pub(crate) filter_policies: Option<Vec<Arc<dyn FilterPolicy>>>,
+    pub(crate) segment_extractor: Option<Arc<dyn PrefixExtractor>>,
 }
 
 impl StorageSemantics {
@@ -273,6 +274,17 @@ impl StorageSemantics {
     /// reader paths aligned on SST filter encoding/decoding behavior.
     pub fn with_filter_policies(mut self, policies: Vec<Arc<dyn FilterPolicy>>) -> Self {
         self.filter_policies = Some(policies);
+        self
+    }
+
+    /// Sets the segment extractor (RFC-0024) for SlateDB readers.
+    ///
+    /// SlateDB persists the writer's segment-extractor name in the manifest and
+    /// rejects a reader whose configured extractor does not match. System
+    /// crates use this to keep the standalone reader aligned with the writer,
+    /// which installs the same extractor on its `DbBuilder`.
+    pub fn with_segment_extractor(mut self, extractor: Arc<dyn PrefixExtractor>) -> Self {
+        self.segment_extractor = Some(extractor);
         self
     }
 }
@@ -402,6 +414,9 @@ pub async fn create_storage_read(
             }
             if let Some(policies) = semantics.filter_policies {
                 builder = builder.with_filter_policies(policies);
+            }
+            if let Some(extractor) = semantics.segment_extractor {
+                builder = builder.with_segment_extractor(extractor);
             }
             if let Some(cache) = cache.clone() {
                 builder = builder.with_db_cache(cache);

@@ -371,6 +371,7 @@ mod integration_tests {
     async fn manifest_segment_ids(slate: &SlateDbStorageConfig) -> Vec<u32> {
         let object_store = create_object_store(&slate.object_store).expect("object store");
         let reader = DbReader::builder(slate.path.clone(), object_store)
+            .with_segment_extractor(super::LogSegmentExtractor::shared())
             .build()
             .await
             .expect("open DbReader");
@@ -419,6 +420,7 @@ mod integration_tests {
         // then — reopen as a DbReader and verify the extractor name is persisted
         let object_store = create_object_store(&slate.object_store).expect("object store");
         let reader = DbReader::builder(slate.path.clone(), object_store)
+            .with_segment_extractor(super::LogSegmentExtractor::shared())
             .build()
             .await
             .expect("open DbReader");

@@ -1,6 +1,7 @@
 //! Byte utilities for key encoding and range queries.
 
 use bytes::{Bytes, BytesMut};
+use slatedb::ByteRangeBounds;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::{Bound, RangeBounds};
 
@@ -94,6 +95,26 @@ impl BytesRange {
             start: Unbounded,
             end: Unbounded,
         }
+    }
+}
+
+/// Converts a `Bound<Bytes>` into the `Bound<&[u8]>` shape that slatedb's
+/// [`ByteRangeBounds`] expects, borrowing the underlying bytes.
+fn bound_as_slice(bound: &Bound<Bytes>) -> Bound<&[u8]> {
+    match bound {
+        Included(b) => Included(b.as_ref()),
+        Excluded(b) => Excluded(b.as_ref()),
+        Unbounded => Unbounded,
+    }
+}
+
+impl ByteRangeBounds for BytesRange {
+    fn start_bound(&self) -> Bound<&[u8]> {
+        bound_as_slice(&self.start)
+    }
+
+    fn end_bound(&self) -> Bound<&[u8]> {
+        bound_as_slice(&self.end)
     }
 }
 
