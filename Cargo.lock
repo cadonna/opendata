@@ -2061,7 +2061,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -3692,7 +3692,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn",
@@ -4572,7 +4572,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.13.0"
-source = "git+https://github.com/slatedb/slatedb.git?branch=main#f68c18409c1f91143c8057b8d3c1b176c70f045b"
+source = "git+https://github.com/slatedb/slatedb.git?rev=bb55a965fa5572ce60668808f5659d4a69e7efcc#bb55a965fa5572ce60668808f5659d4a69e7efcc"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -4616,7 +4616,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.13.0"
-source = "git+https://github.com/slatedb/slatedb.git?branch=main#f68c18409c1f91143c8057b8d3c1b176c70f045b"
+source = "git+https://github.com/slatedb/slatedb.git?rev=bb55a965fa5572ce60668808f5659d4a69e7efcc#bb55a965fa5572ce60668808f5659d4a69e7efcc"
 dependencies = [
  "chrono",
  "log",
@@ -4631,7 +4631,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.13.0"
-source = "git+https://github.com/slatedb/slatedb.git?branch=main#f68c18409c1f91143c8057b8d3c1b176c70f045b"
+source = "git+https://github.com/slatedb/slatedb.git?rev=bb55a965fa5572ce60668808f5659d4a69e7efcc#bb55a965fa5572ce60668808f5659d4a69e7efcc"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5676,20 +5676,7 @@ dependencies = [
  "windows-interface 0.59.3",
  "windows-link 0.1.3",
  "windows-result 0.3.4",
- "windows-strings 0.4.2",
-]
-
-[[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement 0.60.2",
- "windows-interface 0.59.3",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
- "windows-strings 0.5.1",
+ "windows-strings",
 ]
 
 [[package]]
@@ -5788,30 +5775,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-result"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
-dependencies = [
- "windows-link 0.2.1",
-]
-
-[[package]]
 name = "windows-strings"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56e6c93f3a0c3b36176cb1327a4958a0353d5d166c2a35cb268ace15e91d3b57"
 dependencies = [
  "windows-link 0.1.3",
-]
-
-[[package]]
-name = "windows-strings"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
-dependencies = [
- "windows-link 0.2.1",
 ]
 
 [[package]]
