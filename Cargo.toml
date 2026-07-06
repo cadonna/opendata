@@ -49,8 +49,8 @@ serde_json = "1.0"
 serde_with = { version = "3", features = ["base64"] }
 serde_yaml = "0.9"
 foyer = "0.22"
-slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "bb55a965fa5572ce60668808f5659d4a69e7efcc", features = ["compaction_filters"] }
-slatedb-common = { git = "https://github.com/slatedb/slatedb.git", rev = "bb55a965fa5572ce60668808f5659d4a69e7efcc" }
+slatedb = { git = "https://github.com/slatedb/slatedb.git", version = "0.14.1", features = ["compaction_filters"] }
+slatedb-common = { git = "https://github.com/slatedb/slatedb.git", version = "0.14.1" }
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full", "test-util"] }
 tokio-util = "0.7"
